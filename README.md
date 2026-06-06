@@ -1,45 +1,25 @@
 # ternary-constant-cache
 
-[![crate](https://img.shields.io/badge/crate-ternary--constant--cache-blue)](https://crates.io)
-[![license](https://img.shields.io/badge/license-MIT%2FApache--2.0-green)](./LICENSE)
+Constant cache simulation for ternary GPU kernels — hit-rate tracking, access-pattern analysis, LRU eviction, and optimal cache-size estimation. CPU-side profiling tool; no GPU hardware required.
 
-Constant cache simulation for **ternary GPU kernels** — a CPU-side profiling tool that models fixed-size read-only caches for ternary data with hit-rate tracking, LRU eviction, access-pattern analysis, and optimal cache-size estimation.
+## Why This Exists
 
-## Overview
+GPU constant caches are small, fast, read-only caches that broadcast uniform data to every thread in a warp. Weight matrices, lookup tables, bias vectors — if every thread reads the same value, constant cache is the fastest path. But the cache is tiny (typically 8–64 KB) and unforgiving: a miss doesn't just stall one thread, it stalls the whole warp.
 
-GPU constant caches are small, fast, read-only caches that serve uniform data to all threads in a warp. For ternary kernels, the cache holds packed trit data with each 32-byte cache line storing ~161 trits. This crate simulates that cache hierarchy to help you:
+For ternary kernels, the constant cache holds packed trit data — ~161 trits per 32-byte cache line. Before you write your kernel, you need answers: Will my weights fit? What's the expected hit rate? Is my access pattern sequential or pathological? This crate simulates the cache so you can answer those questions without burning GPU hours.
 
-- **Profile cache behavior** before running on real hardware
-- **Classify access patterns** as sequential, strided, or random
-- **Size your constant cache** for optimal hit rates
-- **Track compulsory vs. capacity misses** independently
+## The Key Insight
 
-## Architecture
+The ternary encoding gives constant cache a surprising density advantage. A 32-byte cache line holds 256 bits, which encodes 161 ternary trits (256 / log₂3 ≈ 161). That's 161 ternary weights per cache line versus 256 binary weights per line in a binary network — but ternary weights have only 3 unique values. A ternary kernel accessing a 10K-trit weight matrix needs only ~63 cache lines. That fits entirely in even a small constant cache with near-100% hit rate after warmup.
 
-```
-┌─────────────────────────────────────────────┐
-│              ConstantCache                  │
-│                                             │
-│  ┌──────┐ ┌──────┐ ┌──────┐    ┌──────┐   │
-│  │Line 0│ │Line 1│ │Line 2│...│Line N│   │
-│  │tag=5 │ │tag=12│ │tag=3 │    │tag=7 │   │
-│  └──────┘ └──────┘ └──────┘    └──────┘   │
-│                                             │
-│  LRU order: [5] → [12] → [3] → ... → [7]  │
-│  Evict from tail (LRU) on miss              │
-│                                             │
-│  Stats: hits, misses, evictions, compulsory │
-│         vs capacity miss breakdown          │
-└─────────────────────────────────────────────┘
-```
+The access pattern matters more than the cache size. This crate doesn't just count hits and misses — it *classifies* your access pattern (sequential, strided, or random) and estimates the minimum cache size for a target hit rate. You get actionable data, not just statistics.
 
 ## Quick Start
 
 ```rust
 use ternary_constant_cache::*;
 
-// Create a 16-line constant cache
-let mut cache = ConstantCache::new(16);
+let mut cache = ConstantCache::new(16); // 16 cache lines
 
 // Simulate kernel accesses
 for addr in 0..1024u64 {
@@ -50,91 +30,154 @@ println!("Hit rate: {:.2}%", cache.hit_rate() * 100.0);
 println!("Pattern:  {}", cache.analyze_access_pattern());
 ```
 
-## Access Pattern Analysis
+## Architecture
 
-The cache automatically tracks recent access history and classifies the pattern:
-
-```rust
-use ternary_constant_cache::*;
-
-let mut cache = ConstantCache::new(16);
-
-// Sequential access → AccessPattern::Sequential
-for addr in 0..100u64 { cache.access(addr); }
-assert_eq!(cache.analyze_access_pattern(), AccessPattern::Sequential);
-
-// Strided access → AccessPattern::Strided { stride: 4 }
-for i in 0..50u64 { cache.access(i * 4); }
-// (reset stats first to clear old history)
+```
+┌─────────────────────────────────────────────────┐
+│  ConstantCache (capacity: N lines)              │
+│                                                 │
+│  ┌──────┐ ┌──────┐ ┌──────┐      ┌──────┐     │
+│  │Line 0│ │Line 1│ │Line 2│ ...  │Line N│     │
+│  │tag=5 │ │tag=12│ │tag=3 │      │tag=7 │     │
+│  └──────┘ └──────┘ └──────┘      └──────┘     │
+│                                                 │
+│  LRU order: [5] → [12] → [3] → ... → [7]      │
+│  Evict from tail (LRU) on miss                  │
+│                                                 │
+│  Stats: hits, misses, evictions                 │
+│         compulsory vs capacity miss breakdown   │
+│  History: recent addresses for pattern analysis │
+└─────────────────────────────────────────────────┘
 ```
 
-## Cache Size Estimation
+Three main components:
 
-Find the optimal cache size for your access pattern:
+1. **`ConstantCache`** — The simulator. Set capacity, feed addresses, get hit rates and pattern classification. LRU eviction, compulsory vs. capacity miss tracking.
+2. **`CacheSizeEstimator`** — Sweep cache sizes against your access trace. Find the minimum size for a target hit rate. Measure working set.
+3. **`MissTracker`** — Independent miss classification: compulsory (first access to a line) vs. capacity (was evicted, reaccessed).
+
+## API Reference
+
+### `ConstantCache`
 
 ```rust
-use ternary_constant_cache::*;
+let mut cache = ConstantCache::new(16);           // 16-line cache
 
-let addresses: Vec<u64> = (0..200).flat_map(|_| 0..128u64).collect();
+cache.access(addr);                                // → bool (hit/miss)
+cache.hit_rate();                                  // f64 [0, 1]
+cache.miss_rate();                                 // f64 [0, 1]
+cache.stats();                                     // &CacheStats
+cache.reset_stats();                               // clear stats, keep contents
+cache.analyze_access_pattern();                    // AccessPattern
+cache.preload(addr);                               // warm up a line
+cache.flush();                                     // clear all lines
+cache.occupied();                                  // current line count
+```
 
-// Sweep cache sizes and get hit rates
-let results = CacheSizeEstimator::estimate_optimal_size(&addresses, 1, 16, 1);
-for (size, hit_rate) in &results {
-    println!("Size {}: {:.2}% hit rate", size, hit_rate * 100.0);
+### `CacheStats`
+
+```rust
+pub struct CacheStats {
+    pub total_accesses: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub compulsory_misses: u64,    // first access to a line
+    pub capacity_misses: u64,      // reaccess after eviction
 }
-
-// Find minimum size for 90% hit rate
-let min_size = CacheSizeEstimator::min_size_for_hit_rate(&addresses, 0.9, 32);
-println!("Need at least {} lines for 90% hit rate", min_size.unwrap());
-
-// Working set analysis
-let working_set = CacheSizeEstimator::working_set_size(&addresses);
-println!("Working set: {} unique cache lines", working_set);
 ```
 
-## Miss Tracking
+### `AccessPattern`
 
-Detailed miss classification:
+```rust
+pub enum AccessPattern {
+    Sequential,                  // stride-1
+    Strided { stride: u64 },     // fixed stride > 1
+    Random,                      // irregular
+    Unknown,                     // not enough history yet
+}
+```
+
+### `CacheSizeEstimator`
+
+```rust
+CacheSizeEstimator::estimate_optimal_size(&addresses, min, max, step)
+    // → Vec<(usize, f64)>  — (cache_size, hit_rate) pairs
+
+CacheSizeEstimator::min_size_for_hit_rate(&addresses, target_rate, max_size)
+    // → Option<usize>  — smallest cache achieving target
+
+CacheSizeEstimator::working_set_size(&addresses)
+    // → usize  — unique cache lines touched
+```
+
+### `MissTracker`
+
+```rust
+let mut tracker = MissTracker::new();
+tracker.record(address, was_hit);   // → MissType { Hit, Compulsory, Capacity }
+tracker.compulsory_misses;          // Vec<u64>
+tracker.capacity_misses;            // Vec<u64>
+tracker.total_misses();
+tracker.reset();
+```
+
+### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `CACHE_LINE_SIZE` | 32 | Bytes per cache line (GPU standard) |
+| `TRITS_PER_LINE` | 161 | Ternary trits per line (⌊32 × 8 / log₂3⌋) |
+
+## Real-World Example: Sizing a Weight Cache
 
 ```rust
 use ternary_constant_cache::*;
 
-let mut tracker = MissTracker::new();
+// Simulate accessing a 10K-trit weight matrix repeatedly
+let weight_trits = 10_000;
+let weight_bytes = (weight_trits * 2 + 7) / 8;  // 2 bits per trit, packed
+let addresses: Vec<u64> = (0..100)              // 100 iterations
+    .flat_map(|_| 0..(weight_bytes as u64))
+    .collect();
 
-// Record accesses with hit/miss info
-tracker.record(0, false);                    // Compulsory miss (first time)
-tracker.record(CACHE_LINE_SIZE as u64, false); // Compulsory miss
-tracker.record(0, false);                    // Capacity miss (was evicted)
-tracker.record(0, true);                     // Hit
+// Find minimum cache size for 95% hit rate
+let min_size = CacheSizeEstimator::min_size_for_hit_rate(&addresses, 0.95, 128);
+println!("Need {} cache lines for 95% hit rate", min_size.unwrap());
 
-assert_eq!(tracker.compulsory_misses.len(), 2);
-assert_eq!(tracker.capacity_misses.len(), 1);
+// What's the working set?
+let ws = CacheSizeEstimator::working_set_size(&addresses);
+println!("Working set: {} unique lines", ws);
+
+// Sweep all sizes for a full picture
+let results = CacheSizeEstimator::estimate_optimal_size(&addresses, 1, 64, 1);
+for (size, hr) in &results {
+    println!("  {} lines → {:.1}% hit rate", size, hr * 100.0);
+}
 ```
 
-## Key Types
+## Ecosystem Connections
 
-| Type | Description |
-|------|-------------|
-| `ConstantCache` | Main cache simulator with LRU eviction |
-| `CacheLine` | Individual cache line with tag, data, access tracking |
-| `CacheStats` | Cumulative hit/miss/eviction statistics |
-| `AccessPattern` | Sequential / Strided / Random classification |
-| `CacheSizeEstimator` | Tools for optimal cache sizing |
-| `MissTracker` | Compulsory vs capacity miss analysis |
+| Crate | Relationship |
+|-------|-------------|
+| `ternary-shared-memory` | Shared memory is the fallback when constant cache misses |
+| `ternary-grid-launch` | Launch configs determine how many blocks compete for constant cache |
+| `ternary-warp-block` | Warp-level uniform reads are the primary constant cache use case |
 
-## Constants
+## Performance Characteristics
 
-- `CACHE_LINE_SIZE = 32` — Bytes per cache line (GPU standard).
-- `TRITS_PER_LINE = 161` — Ternary trits per 32-byte line (⌊32 × 8 / log₂(3)⌋).
+- **Access simulation**: O(1) amortized per access — HashMap lookup, VecDeque LRU update
+- **Pattern analysis**: O(H) where H = history length (max 1024)
+- **Cache size sweep**: O(S × A) where S = sizes to sweep, A = addresses in trace
+- **Memory**: O(C + H) where C = cache capacity, H = max history length
+- **Accuracy**: Models a fully-associative LRU cache. Real GPU constant caches are typically 4-way set-associative, so simulated hit rates are an upper bound.
 
-## Testing
+## Open Questions
 
-```bash
-cargo test
-```
+- **Set-associative modeling**: Current simulation is fully-associative. Real GPU constant caches use set associativity, which produces lower hit rates for certain patterns.
+- **Prefetch hints**: Some GPU architectures support constant cache prefetching. Modeling prefetch accuracy would improve sizing estimates.
+- **Multi-warp contention**: Multiple warps sharing the constant cache can evict each other's lines. Per-warm simulation would be more accurate.
 
-16 tests covering sequential/random hit rates, LRU eviction, access pattern detection, cache sizing, miss tracking, preloading, flushing, and working set analysis.
+---
 
-## License
-
-MIT OR Apache-2.0
+*16 tests · MIT OR Apache-2.0 · Zero dependencies*
