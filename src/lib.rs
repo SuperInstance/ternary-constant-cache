@@ -1,0 +1,569 @@
+//! # ternary-constant-cache
+//!
+//! Constant cache simulation for ternary GPU kernels.
+//!
+//! Models a fixed-size read-only cache optimized for ternary (base-3) data access.
+//! Provides hit-rate tracking, access-pattern analysis (sequential vs random), LRU
+//! eviction, and optimal cache-size estimation. CPU-side tool for kernel profiling.
+
+use std::collections::{HashMap, VecDeque};
+
+/// Cache line size in bytes (typical GPU constant cache line = 32 bytes).
+pub const CACHE_LINE_SIZE: usize = 32;
+
+/// Number of trits storable per cache line (32 bytes × 8 bits / log2(3) ≈ 161 trits).
+pub const TRITS_PER_LINE: usize = 161;
+
+/// Unique identifier for a cache line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CacheLineId(pub u64);
+
+/// A single cache line holding ternary data.
+#[derive(Debug, Clone)]
+pub struct CacheLine {
+    pub id: CacheLineId,
+    pub tag: u64,
+    pub data: Vec<u8>,
+    pub valid: bool,
+    pub access_count: u64,
+    pub last_access_cycle: u64,
+}
+
+impl CacheLine {
+    pub fn new(id: CacheLineId, tag: u64) -> Self {
+        Self {
+            id,
+            tag,
+            data: vec![0u8; CACHE_LINE_SIZE],
+            valid: false,
+            access_count: 0,
+            last_access_cycle: 0,
+        }
+    }
+
+    /// Mark this line as accessed.
+    pub fn touch(&mut self, cycle: u64) {
+        self.access_count += 1;
+        self.last_access_cycle = cycle;
+        self.valid = true;
+    }
+}
+
+/// Access pattern classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPattern {
+    /// Sequential stride-1 access.
+    Sequential,
+    /// Access with a fixed stride > 1.
+    Strided { stride: u64 },
+    /// Random / irregular access.
+    Random,
+    /// Unknown (not enough data yet).
+    Unknown,
+}
+
+impl std::fmt::Display for AccessPattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccessPattern::Sequential => write!(f, "Sequential"),
+            AccessPattern::Strided { stride } => write!(f, "Strided(stride={})", stride),
+            AccessPattern::Random => write!(f, "Random"),
+            AccessPattern::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Cache statistics.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    pub total_accesses: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    pub compulsory_misses: u64,
+    pub capacity_misses: u64,
+}
+
+impl CacheStats {
+    pub fn hit_rate(&self) -> f64 {
+        if self.total_accesses == 0 {
+            return 0.0;
+        }
+        self.hits as f64 / self.total_accesses as f64
+    }
+
+    pub fn miss_rate(&self) -> f64 {
+        1.0 - self.hit_rate()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Constant cache with LRU eviction policy.
+#[derive(Debug, Clone)]
+pub struct ConstantCache {
+    /// Total number of cache lines.
+    capacity: usize,
+    /// Cache lines indexed by tag.
+    lines: HashMap<u64, CacheLine>,
+    /// LRU order: front = most recent, back = least recent.
+    lru_order: VecDeque<u64>,
+    /// Current simulation cycle.
+    cycle: u64,
+    /// Statistics.
+    stats: CacheStats,
+    /// Recent access addresses for pattern analysis.
+    access_history: Vec<u64>,
+    /// Maximum history length for pattern analysis.
+    max_history: usize,
+    /// Set of tags ever loaded (for compulsory miss tracking).
+    ever_loaded: std::collections::HashSet<u64>,
+}
+
+impl ConstantCache {
+    /// Create a new constant cache with the given number of lines.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            lines: HashMap::new(),
+            lru_order: VecDeque::new(),
+            cycle: 0,
+            stats: CacheStats::default(),
+            access_history: Vec::new(),
+            max_history: 1024,
+            ever_loaded: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Number of cache lines.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Current number of occupied lines.
+    pub fn occupied(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Get cache statistics.
+    pub fn stats(&self) -> &CacheStats {
+        &self.stats
+    }
+
+    /// Reset statistics (keeps cache contents).
+    pub fn reset_stats(&mut self) {
+        self.stats.reset();
+        self.access_history.clear();
+    }
+
+    /// Compute the tag from a ternary data address (address / line_size).
+    pub fn tag_for_address(address: u64) -> u64 {
+        address / CACHE_LINE_SIZE as u64
+    }
+
+    /// Compute the offset within a cache line.
+    pub fn offset_for_address(address: u64) -> usize {
+        (address % CACHE_LINE_SIZE as u64) as usize
+    }
+
+    /// Access the cache at the given address. Returns true on hit.
+    pub fn access(&mut self, address: u64) -> bool {
+        self.cycle += 1;
+        self.stats.total_accesses += 1;
+        self.access_history.push(address);
+        if self.access_history.len() > self.max_history {
+            self.access_history.remove(0);
+        }
+
+        let tag = Self::tag_for_address(address);
+
+        if let Some(line) = self.lines.get_mut(&tag) {
+            // Cache hit
+            line.touch(self.cycle);
+            self.stats.hits += 1;
+            // Update LRU: move to front
+            self.lru_order.retain(|&t| t != tag);
+            self.lru_order.push_front(tag);
+            true
+        } else {
+            // Cache miss
+            self.stats.misses += 1;
+            if !self.ever_loaded.contains(&tag) {
+                self.stats.compulsory_misses += 1;
+                self.ever_loaded.insert(tag);
+            } else {
+                self.stats.capacity_misses += 1;
+            }
+            self.load_line(tag);
+            false
+        }
+    }
+
+    /// Load a cache line, evicting via LRU if necessary.
+    fn load_line(&mut self, tag: u64) {
+        if self.lines.len() >= self.capacity {
+            // Evict LRU
+            if let Some(lru_tag) = self.lru_order.pop_back() {
+                self.lines.remove(&lru_tag);
+                self.stats.evictions += 1;
+            }
+        }
+        let line_id = CacheLineId(tag);
+        let mut line = CacheLine::new(line_id, tag);
+        line.touch(self.cycle);
+        self.lines.insert(tag, line);
+        self.lru_order.push_front(tag);
+    }
+
+    /// Preload a line into the cache (warm up).
+    pub fn preload(&mut self, address: u64) {
+        let tag = Self::tag_for_address(address);
+        if !self.lines.contains_key(&tag) {
+            self.load_line(tag);
+            self.ever_loaded.insert(tag);
+        }
+    }
+
+    /// Analyze the access pattern from recent history.
+    pub fn analyze_access_pattern(&self) -> AccessPattern {
+        if self.access_history.len() < 4 {
+            return AccessPattern::Unknown;
+        }
+
+        let mut strides: Vec<i64> = Vec::new();
+        for i in 1..self.access_history.len() {
+            strides.push(self.access_history[i] as i64 - self.access_history[i - 1] as i64);
+        }
+
+        // Check if all strides are 1 (sequential)
+        if strides.iter().all(|&s| s == 1) {
+            return AccessPattern::Sequential;
+        }
+
+        // Check for fixed stride
+        if strides.len() >= 2 {
+            let first = strides[0];
+            if first > 1 && strides.iter().all(|&s| s == first) {
+                return AccessPattern::Strided { stride: first as u64 };
+            }
+        }
+
+        AccessPattern::Random
+    }
+
+    /// Get the current hit rate.
+    pub fn hit_rate(&self) -> f64 {
+        self.stats.hit_rate()
+    }
+
+    /// Get the current miss rate.
+    pub fn miss_rate(&self) -> f64 {
+        self.stats.miss_rate()
+    }
+
+    /// Flush the entire cache.
+    pub fn flush(&mut self) {
+        self.lines.clear();
+        self.lru_order.clear();
+    }
+}
+
+/// Optimal cache size estimator.
+pub struct CacheSizeEstimator;
+
+impl CacheSizeEstimator {
+    /// Simulate accesses with varying cache sizes and return (size, hit_rate) pairs.
+    pub fn estimate_optimal_size(
+        addresses: &[u64],
+        min_size: usize,
+        max_size: usize,
+        step: usize,
+    ) -> Vec<(usize, f64)> {
+        let mut results = Vec::new();
+        for size in (min_size..=max_size).step_by(step.max(1)) {
+            let mut cache = ConstantCache::new(size);
+            for &addr in addresses {
+                cache.access(addr);
+            }
+            results.push((size, cache.hit_rate()));
+        }
+        results
+    }
+
+    /// Find the minimum cache size that achieves the target hit rate.
+    pub fn min_size_for_hit_rate(
+        addresses: &[u64],
+        target_hit_rate: f64,
+        max_size: usize,
+    ) -> Option<usize> {
+        for size in 1..=max_size {
+            let mut cache = ConstantCache::new(size);
+            for &addr in addresses {
+                cache.access(addr);
+            }
+            if cache.hit_rate() >= target_hit_rate {
+                return Some(size);
+            }
+        }
+        None
+    }
+
+    /// Compute the working set size (unique cache lines touched).
+    pub fn working_set_size(addresses: &[u64]) -> usize {
+        let tags: std::collections::HashSet<u64> =
+            addresses.iter().map(|&a| ConstantCache::tag_for_address(a)).collect();
+        tags.len()
+    }
+}
+
+/// Miss tracking utility for detailed miss analysis.
+#[derive(Debug, Clone, Default)]
+pub struct MissTracker {
+    pub compulsory_misses: Vec<u64>,
+    pub capacity_misses: Vec<u64>,
+    ever_seen: std::collections::HashSet<u64>,
+}
+
+impl MissTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an access and classify any miss.
+    pub fn record(&mut self, address: u64, hit: bool) -> MissType {
+        if hit {
+            return MissType::Hit;
+        }
+        let tag = ConstantCache::tag_for_address(address);
+        if self.ever_seen.contains(&tag) {
+            self.capacity_misses.push(address);
+            MissType::Capacity
+        } else {
+            self.ever_seen.insert(tag);
+            self.compulsory_misses.push(address);
+            MissType::Compulsory
+        }
+    }
+
+    /// Total miss count.
+    pub fn total_misses(&self) -> usize {
+        self.compulsory_misses.len() + self.capacity_misses.len()
+    }
+
+    /// Reset tracking state.
+    pub fn reset(&mut self) {
+        self.compulsory_misses.clear();
+        self.capacity_misses.clear();
+        self.ever_seen.clear();
+    }
+}
+
+/// Classification of a cache miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissType {
+    Hit,
+    Compulsory,
+    Capacity,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sequential_access_high_hit_rate() {
+        let mut cache = ConstantCache::new(16);
+        // Sequential access: each line holds 32 addresses, so 16 lines hold 512 addresses
+        for _ in 0..3 {
+            for addr in 0..512u64 {
+                cache.access(addr);
+            }
+        }
+        // After warmup, should have very high hit rate
+        assert!(cache.hit_rate() > 0.9, "hit rate was {}", cache.hit_rate());
+    }
+
+    #[test]
+    fn test_random_access_lower_hit_rate() {
+        // Use a deterministic "random" pattern
+        let mut rng_state: u64 = 42;
+        let mut next_random = || -> u64 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            rng_state >> 33
+        };
+
+        let mut cache = ConstantCache::new(4);
+        for _ in 0..1000 {
+            cache.access(next_random() % 256);
+        }
+        // Random access should have lower hit rate than sequential
+        // with only 4 cache lines for 8 possible lines (256/32=8)
+        assert!(cache.hit_rate() < 0.7, "hit rate was {}", cache.hit_rate());
+    }
+
+    #[test]
+    fn test_lru_eviction() {
+        let mut cache = ConstantCache::new(2);
+
+        // Load tag 0
+        cache.access(0);
+        assert_eq!(cache.occupied(), 1);
+
+        // Load tag 1 (different line)
+        cache.access(CACHE_LINE_SIZE as u64);
+        assert_eq!(cache.occupied(), 2);
+
+        // Load tag 2 — should evict tag 0 (LRU)
+        cache.access((CACHE_LINE_SIZE * 2) as u64);
+        assert_eq!(cache.occupied(), 2);
+        assert_eq!(cache.stats.evictions, 1);
+
+        // Access tag 0 again — should be a miss (was evicted)
+        let hit = cache.access(0);
+        assert!(!hit);
+        assert_eq!(cache.stats.evictions, 2);
+    }
+
+    #[test]
+    fn test_cache_size_vs_hit_rate() {
+        // Access pattern that fits in 4 cache lines
+        let addresses: Vec<u64> = (0..200).flat_map(|_| 0..128u64).collect();
+
+        let results = CacheSizeEstimator::estimate_optimal_size(&addresses, 1, 8, 1);
+        // More cache → higher hit rate
+        assert!(results.last().unwrap().1 >= results.first().unwrap().1);
+    }
+
+    #[test]
+    fn test_miss_tracking() {
+        let mut tracker = MissTracker::new();
+
+        // First access to tag 0: compulsory miss
+        assert_eq!(tracker.record(0, false), MissType::Compulsory);
+
+        // First access to tag 1: compulsory miss
+        assert_eq!(tracker.record(CACHE_LINE_SIZE as u64, false), MissType::Compulsory);
+
+        // Second access to tag 0: if miss, it's capacity
+        assert_eq!(tracker.record(0, false), MissType::Capacity);
+
+        // Hit
+        assert_eq!(tracker.record(0, true), MissType::Hit);
+
+        assert_eq!(tracker.compulsory_misses.len(), 2);
+        assert_eq!(tracker.capacity_misses.len(), 1);
+    }
+
+    #[test]
+    fn test_access_pattern_sequential() {
+        let mut cache = ConstantCache::new(16);
+        for addr in 0..100u64 {
+            cache.access(addr);
+        }
+        assert_eq!(cache.analyze_access_pattern(), AccessPattern::Sequential);
+    }
+
+    #[test]
+    fn test_access_pattern_strided() {
+        let mut cache = ConstantCache::new(16);
+        for i in 0..50u64 {
+            cache.access(i * 4);
+        }
+        assert_eq!(cache.analyze_access_pattern(), AccessPattern::Strided { stride: 4 });
+    }
+
+    #[test]
+    fn test_access_pattern_random() {
+        let mut cache = ConstantCache::new(16);
+        // Mixed strides → random
+        let addrs = [0, 5, 100, 3, 200, 7, 50, 11];
+        for &a in &addrs {
+            cache.access(a);
+        }
+        assert_eq!(cache.analyze_access_pattern(), AccessPattern::Random);
+    }
+
+    #[test]
+    fn test_access_pattern_unknown_too_few() {
+        let cache = ConstantCache::new(4);
+        assert_eq!(cache.analyze_access_pattern(), AccessPattern::Unknown);
+    }
+
+    #[test]
+    fn test_preload() {
+        let mut cache = ConstantCache::new(4);
+        cache.preload(0);
+        cache.preload(CACHE_LINE_SIZE as u64);
+        assert_eq!(cache.occupied(), 2);
+        // Accessing preloaded lines should be hits
+        assert!(cache.access(0));
+        assert!(cache.access(CACHE_LINE_SIZE as u64));
+    }
+
+    #[test]
+    fn test_flush() {
+        let mut cache = ConstantCache::new(4);
+        cache.access(0);
+        cache.access(CACHE_LINE_SIZE as u64);
+        assert_eq!(cache.occupied(), 2);
+        cache.flush();
+        assert_eq!(cache.occupied(), 0);
+    }
+
+    #[test]
+    fn test_working_set_size() {
+        let addrs: Vec<u64> = vec![0, 1, 2, CACHE_LINE_SIZE as u64, CACHE_LINE_SIZE as u64 + 1, CACHE_LINE_SIZE as u64 * 2];
+        assert_eq!(CacheSizeEstimator::working_set_size(&addrs), 3);
+    }
+
+    #[test]
+    fn test_min_size_for_hit_rate() {
+        // Pattern touching 4 unique lines
+        let addresses: Vec<u64> = (0..100).flat_map(|i| {
+            let base = (i % 4) as u64 * CACHE_LINE_SIZE as u64;
+            (base..base + 10).collect::<Vec<_>>()
+        }).collect();
+
+        let min_size = CacheSizeEstimator::min_size_for_hit_rate(&addresses, 0.9, 16);
+        assert!(min_size.is_some());
+        assert!(min_size.unwrap() <= 4);
+    }
+
+    #[test]
+    fn test_cache_line_touch() {
+        let mut line = CacheLine::new(CacheLineId(0), 0);
+        assert!(!line.valid);
+        assert_eq!(line.access_count, 0);
+        line.touch(10);
+        assert!(line.valid);
+        assert_eq!(line.access_count, 1);
+        assert_eq!(line.last_access_cycle, 10);
+        line.touch(20);
+        assert_eq!(line.access_count, 2);
+        assert_eq!(line.last_access_cycle, 20);
+    }
+
+    #[test]
+    fn test_stats_reset() {
+        let mut cache = ConstantCache::new(4);
+        cache.access(0);
+        cache.access(0);
+        assert!(cache.stats().total_accesses >= 2);
+        cache.reset_stats();
+        assert_eq!(cache.stats().total_accesses, 0);
+    }
+
+    #[test]
+    fn test_compulsory_vs_capacity_misses() {
+        let mut cache = ConstantCache::new(2);
+        // Touch 3 different tags with only 2 slots
+        cache.access(0);                          // compulsory miss (tag 0)
+        cache.access(CACHE_LINE_SIZE as u64);      // compulsory miss (tag 1)
+        cache.access((CACHE_LINE_SIZE * 2) as u64); // compulsory miss (tag 2), evicts tag 0
+        cache.access(0);                          // capacity miss (tag 0 was evicted)
+        assert_eq!(cache.stats.compulsory_misses, 3);
+        assert_eq!(cache.stats.capacity_misses, 1);
+    }
+}
