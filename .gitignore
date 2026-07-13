@@ -2,3 +2,5 @@
 .env
 credentials.*
 *.secret
+# This is a library crate; Cargo.lock should not be committed.
+Cargo.lock
