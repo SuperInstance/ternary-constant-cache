@@ -279,27 +279,53 @@ impl ConstantCache {
     }
 
     /// Analyze the access pattern from recent history.
+    ///
+    /// Classification is based on the *dominant* stride — the most common gap between
+    /// consecutive accesses. If a single stride accounts for **more than half** of all
+    /// consecutive gaps, the pattern is reported as that stride:
+    ///
+    /// - dominant stride of `1` → [`AccessPattern::Sequential`]
+    /// - dominant stride `> 1` → [`AccessPattern::Strided`]
+    /// - otherwise (no clear majority, or a non-positive dominant stride) →
+    ///   [`AccessPattern::Random`]
+    ///
+    /// Using a majority rather than requiring *every* stride to match deliberately
+    /// tolerates the single large wrap-around jump that occurs when a kernel loops
+    /// over a fixed tile (e.g. `0..N` repeated), which is the most common access shape
+    /// for ternary kernels. At least 4 accesses are required; before that,
+    /// [`AccessPattern::Unknown`] is returned.
     pub fn analyze_access_pattern(&self) -> AccessPattern {
         if self.access_history.len() < 4 {
             return AccessPattern::Unknown;
         }
 
-        let mut strides: Vec<i64> = Vec::new();
+        let mut strides: Vec<i64> = Vec::with_capacity(self.access_history.len() - 1);
         for i in 1..self.access_history.len() {
             strides.push(self.access_history[i] as i64 - self.access_history[i - 1] as i64);
         }
 
-        // Check if all strides are 1 (sequential)
-        if strides.iter().all(|&s| s == 1) {
-            return AccessPattern::Sequential;
+        // Tally how often each stride value occurs.
+        let mut counts: HashMap<i64, usize> = HashMap::new();
+        for &s in &strides {
+            *counts.entry(s).or_insert(0) += 1;
         }
 
-        // Check for fixed stride
-        if strides.len() >= 2 {
-            let first = strides[0];
-            if first > 1 && strides.iter().all(|&s| s == first) {
+        let total = strides.len();
+        // `strides` is non-empty whenever the history has >= 4 entries.
+        let (dominant, dominant_count) = counts
+            .into_iter()
+            .max_by_key(|&(_, c)| c)
+            .expect("at least one stride when history length >= 4");
+
+        // Require a strict majority: one stride must make up more than half the gaps.
+        // At most a single value can satisfy this, so the result is deterministic.
+        if dominant_count * 2 > total {
+            if dominant == 1 {
+                return AccessPattern::Sequential;
+            }
+            if dominant > 1 {
                 return AccessPattern::Strided {
-                    stride: first as u64,
+                    stride: dominant as u64,
                 };
             }
         }
@@ -581,6 +607,20 @@ mod tests {
     fn test_access_pattern_unknown_too_few() {
         let cache = ConstantCache::new(4);
         assert_eq!(cache.analyze_access_pattern(), AccessPattern::Unknown);
+    }
+
+    #[test]
+    fn test_access_pattern_cyclic_tile_is_not_random() {
+        // A kernel that loops over a fixed tile (0..N repeated) is the most common
+        // ternary access shape. It has a single wrap-around jump per iteration, which
+        // must NOT cause it to be misreported as Random.
+        let mut cache = ConstantCache::new(16);
+        for _ in 0..5 {
+            for addr in 0..96u64 {
+                cache.access(addr);
+            }
+        }
+        assert_eq!(cache.analyze_access_pattern(), AccessPattern::Sequential);
     }
 
     #[test]
