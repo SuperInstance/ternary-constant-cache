@@ -80,7 +80,13 @@ The simulation uses:
 
 ### Access Pattern Detection
 
-The cache tracks recent access addresses and classifies the pattern:
+The cache tracks recent access addresses and classifies the pattern by the **dominant stride** — the single gap value between consecutive accesses that occurs more often than all others combined (a strict majority). If such a dominant stride exists:
+
+- stride `1` → `Sequential`
+- stride `> 1` → `Strided { stride }`
+- otherwise (no majority, e.g. genuinely irregular) → `Random`
+
+Using a majority (rather than requiring *every* stride to match) means a kernel that **loops over a fixed tile** — e.g. `0..N` repeated, which injects one large wrap-around jump per iteration — is still correctly reported as `Sequential`/`Strided`, not misreported as `Random`. At least 4 accesses are required; before that it returns `AccessPattern::Unknown`.
 
 ```rust
 // Sequential: every access is +1 from the previous
@@ -91,12 +97,14 @@ assert_eq!(cache.analyze_access_pattern(), AccessPattern::Sequential);
 for i in 0..50u64 { cache.access(i * 4); }
 // pattern is Strided { stride: 4 }
 
+// Cyclic tile: 0..96 repeated still reads as Sequential (wrap-around tolerated)
+for _ in 0..5 { for addr in 0..96u64 { cache.access(addr); } }
+// pattern is Sequential
+
 // Random: no consistent pattern
 cache.access(42); cache.access(7); cache.access(999); cache.access(3);
 // pattern is Random
 ```
-
-Pattern classification needs at least 4 accesses. Before that, it returns `AccessPattern::Unknown`.
 
 ## API Reference
 
@@ -218,10 +226,12 @@ println!("Hit rate: {:.2}%", cache.hit_rate() * 100.0);  // Very low
 
 ## Performance Notes
 
-- **Sequential access hit rate**: Approaches `(cache_lines − 1) / cache_lines` after warmup. With 16 lines, you'll see ~94% hit rate.
-- **Random access hit rate**: Approximates `cache_size / working_set`. If your working set is 64 lines and you have 8 cache lines, expect ~12.5%.
-- **Optimal sizing**: Use `CacheSizeEstimator::min_size_for_hit_rate` with your target. The function is O(max_size × N) — fast for reasonable values.
-- **Trit density**: 161 trits per 32-byte line means constant cache is 5× denser for ternary data than for float32 data (8 floats per line).
+- **Sequential access hit rate** depends on whether the working set fits in the cache:
+  - **Working set fits** (e.g. the Quick Start above, 16 lines accessed over 3 rounds): after the first cold pass every access is a hit, so the rate approaches 100%. For that exact example it is `1520 / 1536 ≈ 98.96%` (the 16 misses are the first cold touch of each line).
+  - **Never-repeating stream** (infinite sequential scan, working set larger than the cache): each 32-byte line is loaded once and yields `CACHE_LINE_SIZE − 1 = 31` hits before the next line, so the rate approaches `(CACHE_LINE_SIZE − 1) / CACHE_LINE_SIZE = 31 / 32 ≈ 96.9%`. This bound is in *bytes per line*, not in number of cache lines.
+- **Random access hit rate**: Roughly `cache_size / working_set` under the independent-reference model. If your working set is 64 lines and you have 8 cache lines, expect ~12.5%.
+- **Optimal sizing**: Use `CacheSizeEstimator::min_size_for_hit_rate` with your target. Each simulated access updates recency with a linear scan over the resident lines, so a single simulation is `O(capacity × N)` and the full sweep is `O(max_size² × N)` — fine for reasonable values.
+- **Trit density**: 161 trits per 32-byte line means constant cache holds ~20× more ternary weights per line than float32 weights (161 trits vs 8 float32 values per 32-byte line). (For comparison it is ~5× denser than packed int8, which holds 32 values per line.)
 
 ## Open Questions
 
@@ -232,4 +242,9 @@ println!("Hit rate: {:.2}%", cache.hit_rate() * 100.0);  // Very low
 
 ## License
 
-MIT OR Apache-2.0
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT License ([LICENSE](LICENSE))
+
+at your option.
